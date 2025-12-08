@@ -1,0 +1,529 @@
+
+Controller Design Guide for Spring Boot Microservices
+=====================================================
+
+Goal
+----
+This file is your reusable template & checklist for designing **REST controllers**
+in Spring Boot microservices.
+
+A *Controller* is the entry point for HTTP:
+- It receives HTTP requests (JSON, path params, query params).
+- It calls **services** to perform use cases.
+- It returns HTTP responses (status codes + JSON bodies).
+
+Controllers should be **thin**: no DB logic, minimal business logic.
+
+
+Big Picture: Layer Direction
+----------------------------
+
+Client (HTTP/JSON)
+        ↓
+Controller  →  Service  →  Repository  →  Entity  →  Database
+
+
+Golden Rules / Rules of Thumb
+-----------------------------
+1. Controllers expose APIs; services implement business rules.
+2. Controller methods should be small and readable.
+3. Map HTTP → Java: parameters, request bodies, response status.
+4. Return proper HTTP status codes (`201 Created`, `200 OK`, `204 No Content`, etc.).
+5. Use DTOs for request/response when needed (don’t always expose entities directly).
+6. Never call repositories directly from controllers (always go via services).
+7. No transactions in controller layer; those belong to services.
+
+
+Basic Controller Template
+-------------------------
+Package suggestion:
+- `com.<company>.<app>.<feature>.controller`
+
+Generic example for feature X:
+
+```java
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/x")
+public class XController {
+
+    private final XService xService;
+
+    public XController(XService xService) {
+        this.xService = xService;
+    }
+
+    // controller methods go here
+}
+```
+
+Key annotations:
+- `@RestController` – marks the class as a REST controller (includes `@ResponseBody`).
+- `@RequestMapping("/api/x")` – base path for all endpoints in this controller.
+
+
+Typical CRUD Endpoints
+----------------------
+
+1. Create (POST)
+----------------
+
+```java
+@PostMapping
+public ResponseEntity<XResponseDto> create(@RequestBody XCreateRequest request) {
+    XResponseDto created = xService.createX(request);
+    return ResponseEntity.status(HttpStatus.CREATED).body(created);
+}
+```
+
+Points:
+- `POST /api/x`
+- Input: `@RequestBody` mapped from JSON.
+- Output: created resource, status 201.
+
+
+2. Read All (GET collection)
+----------------------------
+
+```java
+@GetMapping
+public List<XResponseDto> getAll() {
+    return xService.getAllX();
+}
+```
+
+Points:
+- `GET /api/x`
+- Returns a list (possibly paginated – see section on pagination).
+
+
+3. Read One (GET by id)
+------------------------
+
+```java
+@GetMapping("/{id}")
+public XResponseDto getOne(@PathVariable Long id) {
+    return xService.getX(id);
+}
+```
+
+Points:
+- `GET /api/x/{id}`
+- `@PathVariable` binds `{id}` from URL.
+- Service throws exception if not found (mapped by global exception handler).
+
+
+4. Update (PUT/PATCH)
+---------------------
+
+```java
+@PutMapping("/{id}")
+public XResponseDto update(@PathVariable Long id,
+                           @RequestBody XUpdateRequest request) {
+    return xService.updateX(id, request);
+}
+```
+
+Points:
+- `PUT /api/x/{id}` for full or major updates.
+- `PATCH` can be used for partial updates.
+- Input: `@RequestBody` with fields to change.
+
+
+5. Delete (DELETE)
+------------------
+
+```java
+@DeleteMapping("/{id}")
+@ResponseStatus(HttpStatus.NO_CONTENT)
+public void delete(@PathVariable Long id) {
+    xService.deleteX(id);
+}
+```
+
+Points:
+- `DELETE /api/x/{id}`
+- No body returned, status `204 No Content`.
+
+
+Using DTOs (Recommended)
+------------------------
+Instead of exposing entities directly, consider using DTOs:
+
+```java
+public class XCreateRequest {
+    private String name;
+    private String description;
+    // getters / setters
+}
+
+public class XUpdateRequest {
+    private String name;
+    private String description;
+    // getters / setters
+}
+
+public class XResponseDto {
+    private Long id;
+    private String name;
+    private String description;
+    // getters / setters
+}
+```
+
+Controller then delegates mapping to the service or a mapper class.
+
+Rule of thumb:
+- Use DTOs when your API contract is different from DB schema,
+  or you want to hide fields/internal details.
+
+
+Handling Query Parameters and Filtering
+---------------------------------------
+
+Example:
+- `GET /api/x?status=ACTIVE&from=2024-01-01&to=2024-01-31`
+
+```java
+@GetMapping("/search")
+public List<XResponseDto> search(
+        @RequestParam(required = false) String status,
+        @RequestParam(required = false) String from,
+        @RequestParam(required = false) String to) {
+
+    return xService.searchX(status, from, to);
+}
+```
+
+Annotations:
+- `@RequestParam` – query parameters (after the `?` in URL).
+- `required = false` – make them optional.
+
+Rule of thumb:
+- Keep query parameter names simple and descriptive (`page`, `size`, `sort`, `status`).
+
+
+Pagination & Sorting in Controllers
+-----------------------------------
+For lists that can grow large, expose pagination:
+
+Example endpoint:
+- `GET /api/x?page=0&size=20&sort=createdAt,desc`
+
+```java
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.web.PageableDefault;
+
+@GetMapping
+public Page<XResponseDto> getAll(
+        @PageableDefault(size = 20, sort = "createdAt") Pageable pageable) {
+
+    return xService.getAllX(pageable);
+}
+```
+
+Points:
+- Spring can automatically bind `page`, `size`, `sort` to `Pageable`.
+- The service uses `Pageable` with repository methods.
+
+Rule of thumb:
+- Always think about pagination for endpoints that return lists of entities.
+
+
+Validation in Controllers
+-------------------------
+Basic request validation can be done using Bean Validation (`jakarta.validation`).
+
+Example DTO:
+
+```java
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public class XCreateRequest {
+
+    @NotBlank
+    @Size(max = 100)
+    private String name;
+
+    @Size(max = 255)
+    private String description;
+
+    // getters / setters
+}
+```
+
+Controller method:
+
+```java
+import jakarta.validation.Valid;
+
+@PostMapping
+public ResponseEntity<XResponseDto> create(@Valid @RequestBody XCreateRequest request) {
+    XResponseDto created = xService.createX(request);
+    return ResponseEntity.status(HttpStatus.CREATED).body(created);
+}
+```
+
+Rule of thumb:
+- Use `@Valid` on `@RequestBody` parameters.
+- Keep heavy validation in services where you have context; use Bean Validation for structure/format.
+
+
+Error Handling & HTTP Status Mapping
+------------------------------------
+Use a `@ControllerAdvice` to map exceptions to HTTP responses.
+
+Example:
+
+```java
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+
+@ControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(XNotFoundException.class)
+    public ResponseEntity<String> handleNotFound(XNotFoundException ex) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ex.getMessage());
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<String> handleBadRequest(IllegalArgumentException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(ex.getMessage());
+    }
+
+    // Add more handlers as needed
+}
+```
+
+Rule of thumb:
+- Don’t clutter controller methods with try/catch blocks for expected business exceptions.
+- Let exceptions bubble up and handle them centrally.
+
+
+Path Design & Versioning
+------------------------
+Common base path patterns:
+
+- `/api/x` – basic collection.
+- `/api/v1/x` – versioned APIs (v1, v2, ...).
+
+Examples:
+
+```java
+@RestController
+@RequestMapping("/api/v1/x")
+public class XController {
+    // ...
+}
+```
+
+Rule of thumb:
+- Decide API versioning strategy early (path-based `/v1/`, header-based, etc.).
+- For personal learning projects, `/api/x` is enough; for real products, prefer versioning.
+
+
+Security in Controllers (High Level)
+------------------------------------
+Controllers often have method-level security:
+
+```java
+import org.springframework.security.access.prepost.PreAuthorize;
+
+@RestController
+@RequestMapping("/api/x")
+public class XController {
+
+    @PreAuthorize("hasRole('ADMIN')")
+    @PostMapping
+    public ResponseEntity<XResponseDto> create(...) {
+        // only ADMIN
+    }
+
+    @PreAuthorize("isAuthenticated()")
+    @GetMapping("/{id}")
+    public XResponseDto getOne(@PathVariable Long id) {
+        // any authenticated user
+    }
+}
+```
+
+Rule of thumb:
+- Keep security rules declarative (`@PreAuthorize`), not hard-coded deep in service.
+- Let Spring Security handle authentication; controllers just declare access rules.
+
+
+Special Cases & Patterns
+------------------------
+
+1. Partial Updates (PATCH)
+--------------------------
+When only a few fields can be updated:
+
+```java
+@PatchMapping("/{id}")
+public XResponseDto patch(@PathVariable Long id,
+                          @RequestBody XPatchRequest request) {
+    return xService.patchX(id, request);
+}
+```
+
+Here `XPatchRequest` may have all fields nullable and service decides what to update.
+
+2. Custom Actions on a Resource
+-------------------------------
+Example: `/api/orders/{id}/cancel`
+
+```java
+@PostMapping("/{id}/cancel")
+public XResponseDto cancel(@PathVariable Long id) {
+    return xService.cancelX(id);
+}
+```
+
+Rule of thumb:
+- For actions that are not pure CRUD but operate on a single resource, use
+  sub-paths like `/{id}/action`.
+
+
+3. File Upload / Download
+-------------------------
+Not always needed, but pattern is:
+
+Upload:
+
+```java
+import org.springframework.web.multipart.MultipartFile;
+
+@PostMapping("/upload")
+public ResponseEntity<Void> upload(@RequestParam("file") MultipartFile file) {
+    xService.processFile(file);
+    return ResponseEntity.accepted().build();
+}
+```
+
+Download:
+
+```java
+@GetMapping("/{id}/download")
+public ResponseEntity<byte[]> download(@PathVariable Long id) {
+    byte[] content = xService.getFileContent(id);
+    return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename="file.txt"")
+            .body(content);
+}
+```
+
+
+Step-by-Step Checklist When Creating a Controller
+-------------------------------------------------
+When you create a new controller for feature X, follow this list:
+
+1. **Define base path.**
+   - Example: `/api/x` or `/api/v1/x`.
+
+2. **List all endpoints in plain language.**
+   - “Create X”, “Get X by id”, “List X with filters”, “Update X”, “Delete X”, “Custom action Y”.
+
+3. **Decide HTTP verbs and paths.**
+   - Create → `POST /api/x`
+   - Read all → `GET /api/x`
+   - Read one → `GET /api/x/{id}`
+   - Update → `PUT /api/x/{id}` or `PATCH /api/x/{id}`
+   - Delete → `DELETE /api/x/{id}`
+   - Custom → e.g. `POST /api/x/{id}/cancel`
+
+4. **Design request/response DTOs (if needed).**
+   - `XCreateRequest`, `XUpdateRequest`, `XResponseDto`, etc.
+
+5. **Write method signatures.**
+   - Map path variables (`@PathVariable`), query parameters (`@RequestParam`),
+     bodies (`@RequestBody`), and headers (`@RequestHeader`) if needed.
+
+6. **Delegate to service layer.**
+   - Call `xService` methods with minimal logic in the controller.
+
+7. **Apply validation.**
+   - Use `@Valid` on request bodies where appropriate.
+
+8. **Think about pagination for list endpoints.**
+   - Consider `Pageable` and `Page<T>` return type.
+
+9. **Consider security annotations.**
+   - Add `@PreAuthorize` or define access rules in configuration.
+
+10. **Leave error handling to `@ControllerAdvice`.**
+    - Don’t overcomplicate controller methods with error mapping.
+
+
+Example: Generic Controller Skeleton for Any X
+----------------------------------------------
+
+```java
+package com.company.app.x.controller;
+
+import com.company.app.x.service.XService;
+import com.company.app.x.web.XCreateRequest;
+import com.company.app.x.web.XUpdateRequest;
+import com.company.app.x.web.XResponseDto;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/x")
+@RequiredArgsConstructor
+public class XController {
+
+    private final XService xService;
+
+    @PostMapping
+    public ResponseEntity<XResponseDto> create(@Valid @RequestBody XCreateRequest request) {
+        XResponseDto created = xService.createX(request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
+    }
+
+    @GetMapping
+    public List<XResponseDto> getAll() {
+        return xService.getAllX();
+    }
+
+    @GetMapping("/{id}")
+    public XResponseDto getOne(@PathVariable Long id) {
+        return xService.getX(id);
+    }
+
+    @PutMapping("/{id}")
+    public XResponseDto update(@PathVariable Long id,
+                               @Valid @RequestBody XUpdateRequest request) {
+        return xService.updateX(id, request);
+    }
+
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void delete(@PathVariable Long id) {
+        xService.deleteX(id);
+    }
+}
+```
+
+Final Thoughts
+--------------
+- A good controller feels like a **clean HTTP façade** over your service layer.
+- If your controller methods are short and almost read like an API specification,
+  you’re doing it right.
+- Use this file as a reference every time you design a new controller: focus on
+  HTTP paths/verbs, request/response mapping, and keep real logic in services.

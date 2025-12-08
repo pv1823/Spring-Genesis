@@ -1,0 +1,350 @@
+
+Repository Design Guide for Spring Boot Microservices
+=====================================================
+
+Goal
+----
+This file is your reusable template & checklist for designing **repositories**
+in Spring Boot microservices using Spring Data JPA.
+
+A *Repository* is the abstraction that hides raw database access behind
+a **clean interface**. It works with your Entity and is called by your Service.
+
+
+High-Level Idea
+---------------
+For each Entity `XEntity`, you typically create a `XRepository` interface.
+
+Dependency direction (remember):
+Controller → Service → Repository → Entity → Database
+
+
+Golden Rules / Rules of Thumb
+-----------------------------
+1. Repositories are for **data access**, not business logic.
+2. They should look like simple, intention-revealing interfaces.
+3. Try `JpaRepository` first; only add custom queries if really needed.
+4. Prefer derived query methods (`findByStatusAndType`) over big complex `@Query` strings.
+5. Keep relationships and fetching strategies in mind to avoid N+1 problems.
+6. If a query is non-trivial, document it (Javadoc) for your future self.
+7. Never call external systems from repositories (no HTTP, no messaging).
+
+
+Basic Repository Template
+-------------------------
+Package suggestion:
+- `com.<company>.<app>.<feature>.repository`
+
+Minimal template for entity `XEntity` with id type `Long`:
+
+```java
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface XRepository extends JpaRepository<XEntity, Long> {
+    // CRUD methods come from JpaRepository
+}
+```
+
+What `JpaRepository` gives you by default
+-----------------------------------------
+Common methods inherited from `JpaRepository<XEntity, Long>`:
+
+- `Optional<XEntity> findById(Long id)`
+- `List<XEntity> findAll()`
+- `XEntity save(XEntity entity)`
+- `void deleteById(Long id)`
+- `boolean existsById(Long id)`
+- `long count()`
+- and several overloads with `Sort` and `Pageable`
+
+Rule of thumb:
+- Start with these; don’t over-design custom queries too early.
+
+
+Derived Query Methods (Query by Method Name)
+--------------------------------------------
+Spring Data can generate queries based on method names.
+
+Example patterns:
+
+```java
+List<XEntity> findByStatus(String status);
+
+List<XEntity> findByNameContainingIgnoreCase(String namePart);
+
+List<XEntity> findByStatusAndType(String status, String type);
+
+Optional<XEntity> findFirstByOrderByCreatedAtDesc();
+
+long countByStatus(String status);
+
+boolean existsByExternalId(String externalId);
+```
+
+Rules of thumb:
+- Use clear, descriptive names even if they’re long.
+- Avoid more than ~3 conditions in one method name; consider `@Query` if too complex.
+- For “search-like” queries, use `Containing`, `StartsWith`, `EndsWith`, `IgnoreCase`.
+
+
+Using @Query (JPQL or Native)
+-----------------------------
+Sometimes you need more control than derived names provide.
+
+Example JPQL query:
+
+```java
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+public interface XRepository extends JpaRepository<XEntity, Long> {
+
+    @Query("select x from XEntity x where x.status = :status and x.priority >= :minPriority")
+    List<XEntity> findByStatusWithMinPriority(@Param("status") String status,
+                                              @Param("minPriority") int minPriority);
+}
+```
+
+Example native query:
+
+```java
+@Query(value = "select * from x where status = :status limit :limit", nativeQuery = true)
+List<XEntity> findNativeByStatus(@Param("status") String status,
+                                 @Param("limit") int limit);
+```
+
+Rules of thumb:
+- Prefer JPQL over native, unless you need DB-specific features.
+- Keep queries readable; extract complex logic to service layer when possible.
+- Always bind parameters with `@Param` – avoid string concatenation.
+
+
+Pagination and Sorting
+----------------------
+For large datasets, use Spring Data’s pagination and sorting support.
+
+```java
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+
+public interface XRepository extends JpaRepository<XEntity, Long> {
+
+    Page<XEntity> findByStatus(String status, Pageable pageable);
+}
+```
+
+Usage concept in service:
+
+```java
+Pageable pageRequest = PageRequest.of(pageNumber, pageSize, Sort.by("createdAt").descending());
+Page<XEntity> page = xRepository.findByStatus("ACTIVE", pageRequest);
+```
+
+Rule of thumb:
+- Expose pagination at the API level for lists that can grow large.
+- Don’t return `List` when you really should page the results.
+
+
+Projections (Optional, Advanced)
+--------------------------------
+You don’t always need full entities; sometimes you just need a few fields.
+
+Interface-based projection:
+
+```java
+public interface XSummary {
+    Long getId();
+    String getName();
+    String getStatus();
+}
+
+public interface XRepository extends JpaRepository<XEntity, Long> {
+
+    List<XSummary> findByStatus(String status);
+}
+```
+
+Rule of thumb:
+- Use projections to reduce over-fetching and speed up list endpoints.
+- Still keep logic in service; repository only defines the projection.
+
+
+Modifying Queries (UPDATE / DELETE)
+-----------------------------------
+Most updates should be done by loading an entity, modifying it, and `save()`ing it.
+
+In rare cases, you need a direct bulk update/delete:
+
+```java
+import org.springframework.data.jpa.repository.Modifying;
+
+public interface XRepository extends JpaRepository<XEntity, Long> {
+
+    @Modifying
+    @Query("update XEntity x set x.status = :newStatus where x.status = :oldStatus")
+    int bulkUpdateStatus(@Param("oldStatus") String oldStatus,
+                         @Param("newStatus") String newStatus);
+}
+```
+
+Rules of thumb:
+- Mark modifying queries with `@Modifying` and ensure they run in a transaction.
+- Remember bulk updates bypass entity lifecycle callbacks (`@PreUpdate`) and may
+  leave the persistence context out of sync. Clear the context if necessary.
+
+
+Special Cases & Pitfalls
+------------------------
+
+1. N+1 Select Problem
+---------------------
+If an entity has relationships (like `@OneToMany`), naive fetching can cause many queries.
+
+Example: For each X, we lazy-load its children Y in a loop → 1 query for X list + N queries for Y.
+
+Mitigations:
+- Use `fetch = FetchType.LAZY` on associations by default.
+- Use `@EntityGraph` or `join fetch` in specific queries when you genuinely want to fetch children.
+
+Example with `@EntityGraph`:
+
+```java
+import org.springframework.data.jpa.repository.EntityGraph;
+
+@EntityGraph(attributePaths = {"children"})
+List<XEntity> findByStatus(String status);
+```
+
+Rule of thumb:
+- Do NOT set `EAGER` on every relationship as a quick fix. It often makes things worse.
+
+2. Soft Delete
+--------------
+If your entity uses a `deleted` flag instead of physical deletion, the repository must be aware of it.
+
+Example:
+
+```java
+List<XEntity> findByDeletedFalse();
+
+Optional<XEntity> findByIdAndDeletedFalse(Long id);
+```
+
+Rule of thumb:
+- Be consistent: all “read” queries should filter out deleted rows,
+  or centralize this logic clearly in service/query layer.
+
+3. “exists” and “count”
+------------------------
+Use specialized methods instead of loading full entities when you just need existence or counts.
+
+```java
+boolean existsByExternalId(String externalId);
+long countByStatus(String status);
+```
+
+Rule of thumb:
+- If you only need to know “does it exist?” or “how many?”,
+  don’t call `findAll()` and count in memory.
+
+4. Optional vs Null
+-------------------
+`findById` returns `Optional<XEntity>` by default.
+
+For custom methods, decide knowingly:
+- `Optional<XEntity> findByBusinessKey(String key);`
+- `XEntity findFirstByOrderByCreatedAtDesc();` (only if you are sure it exists)
+
+Rule of thumb:
+- Use `Optional` in repository signatures when "no result" is expected and normal.
+
+5. Transactions
+---------------
+Repositories don’t usually need `@Transactional` themselves – they rely on
+service-layer transactions.
+
+Rule of thumb:
+- Annotate **service methods** with `@Transactional`.
+- Avoid placing transactional boundaries in repository interfaces.
+
+
+Mental Model: How to Design a New Repository
+--------------------------------------------
+When you create a repository for a new entity X, think in this order:
+
+1. **Confirm Entity**
+   - Is `XEntity` defined with correct fields, primary key, and relationships?
+
+2. **Define base repository**
+   - `interface XRepository extends JpaRepository<XEntity, Long>`
+
+3. **List main data access needs in plain English**
+   - "Get one X by id"
+   - "List all X with status ACTIVE"
+   - "Find X by external reference"
+   - "Check if X exists for user Y"
+
+4. **Turn those into methods**
+   - `Optional<XEntity> findById(Long id);`  → already there from `JpaRepository`
+   - `List<XEntity> findByStatus(String status);`
+   - `Optional<XEntity> findByExternalRef(String externalRef);`
+   - `boolean existsByUserId(Long userId);`
+
+5. **Check if pagination/sorting is needed**
+   - Change `List<XEntity>` to `Page<XEntity>` where necessary.
+
+6. **Add `@Query` only when necessary**
+   - If the method name becomes too long or the logic too specific.
+
+7. **Review for correctness and clarity**
+   - No business decisions in repository.
+   - Method names readable and meaningful.
+   - Think about performance: paging, projections, avoiding N+1.
+
+
+Example: Generic Repository Skeleton for Any X
+----------------------------------------------
+
+```java
+package com.company.app.x.repository;
+
+import com.company.app.x.entity.XEntity;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface XRepository extends JpaRepository<XEntity, Long> {
+
+    // Single entity lookups
+    Optional<XEntity> findByBusinessKey(String businessKey);
+
+    // Lists (non-paged)
+    List<XEntity> findByStatus(String status);
+
+    // Paged list
+    Page<XEntity> findByStatus(String status, Pageable pageable);
+
+    // Simple existence / counts
+    boolean existsByBusinessKey(String businessKey);
+
+    long countByStatus(String status);
+
+    // Derived search pattern example
+    List<XEntity> findByNameContainingIgnoreCase(String namePart);
+}
+```
+
+Final Thoughts
+--------------
+- A good repository interface feels like a small, focused contract
+  between the **service layer** and the **database**.
+- Keep it expressive but minimal: if your repository has dozens of methods,
+  step back and see if some use cases can be unified or moved to service logic.
+- Always remember: repositories are about **data access**, not orchestration.

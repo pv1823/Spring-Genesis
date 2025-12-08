@@ -1,0 +1,576 @@
+
+Spring Environment & Configuration Guide
+========================================
+
+File name suggestion: spring_env_guide.txt
+
+
+Goal
+----
+This file is your reusable template & checklist for working with the **Spring Environment**:
+- Profiles (`dev`, `test`, `stage`, `prod`, etc.)
+- Configuration properties (`application.yml` / `application.properties`)
+- `@ConfigurationProperties` binding
+- Feature flags
+- Secrets and environment variables
+
+This is about **how your microservice reads its configuration** in a clean, modern, and production-ready way.
+
+
+1. Big Picture – Where Config Lives
+-----------------------------------
+In a Spring Boot microservice, configuration can come from (priority order, highest wins):
+
+1. Command line arguments (`--server.port=8081`)
+2. OS environment variables (`DB_HOST`, `DB_USER`, etc.)
+3. Java system properties (`-Dspring.profiles.active=dev`)
+4. `application-{profile}.yml` / `application.yml` in the classpath
+5. Defaults inside your code (`@Value("${...:default}")` or default fields in `@ConfigurationProperties`)
+6. Remote config services (Spring Cloud Config, Vault, etc. – optional/advanced)
+
+Rule of thumb:
+- Prefer **external configuration** (env vars, profile-specific files) over hard-coded values.
+- Make your microservice **12-factor friendly** (config outside code).
+
+
+2. application.yml Structure
+----------------------------
+Most microservices use `application.yml` as the main config file.
+
+Example base file:
+
+```yaml
+spring:
+  application:
+    name: nyx
+
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:nyx_products}
+    username: ${DB_USER:root}
+    password: ${DB_PASSWORD:password}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate.format_sql: true
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when_authorized
+
+app:
+  default-currency: "USD"
+  feature-flags:
+    publish-product-events: true
+```
+
+Notes:
+- `spring.*` – framework configs.
+- `server.*` – server/HTTP configs.
+- custom `app.*` – **your own domain/config namespace** (recommended).
+
+
+3. Spring Profiles – dev / test / prod
+--------------------------------------
+Profiles let you switch behavior/config per environment.
+
+Common pattern:
+
+- `application.yml`          → shared defaults
+- `application-dev.yml`      → developer machine
+- `application-test.yml`     → automated tests / CI
+- `application-stage.yml`    → staging/QA
+- `application-prod.yml`     → production
+
+Example:
+```yaml
+# application-dev.yml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: update
+  datasource:
+    url: jdbc:mysql://localhost:3306/nyx_products
+    username: root
+    password: password
+
+app:
+  feature-flags:
+    publish-product-events: false
+```
+
+```yaml
+# application-prod.yml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  datasource:
+    url: jdbc:mysql://${DB_HOST}:${DB_PORT:3306}/${DB_NAME}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+
+app:
+  feature-flags:
+    publish-product-events: true
+```
+
+Activating a profile:
+
+- Via env var:
+  - `SPRING_PROFILES_ACTIVE=dev`
+- Via JVM arg:
+  - `-Dspring.profiles.active=dev`
+- Via application.yml (not ideal for prod but okay for local):
+
+```yaml
+spring:
+  profiles:
+    active: dev
+```
+
+Rule of thumb:
+- Use `dev` for local development, `test` for CI, `stage`/`qa` for integration, `prod` for production.
+- NEVER hard-code `prod` profile in source; set it via environment.
+
+
+4. Environment Variables and Placeholders
+-----------------------------------------
+Spring Boot supports placeholder syntax `${...:default}`.
+
+Example:
+```yaml
+spring:
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:nyx_products}
+    username: ${DB_USER:root}
+    password: ${DB_PASSWORD:password}
+```
+
+This means:
+- Use OS env var `DB_HOST` if set, else default to `localhost`.
+- Same for `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`.
+
+Rule of thumb:
+- Use environment variables for **sensitive** or **deployment-specific** values (DB, credentials, endpoints).
+- Always provide sensible defaults for local dev when possible.
+
+
+5. @ConfigurationProperties – Clean Config Binding
+--------------------------------------------------
+Instead of sprinkling `@Value` everywhere, bind a whole config subtree into one class.
+
+Example `application.yml`:
+
+```yaml
+app:
+  default-currency: "USD"
+  feature-flags:
+    publish-product-events: true
+    enable-x: false
+```
+
+Config class:
+
+```java
+import jakarta.validation.constraints.NotBlank;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.util.Map;
+
+@Validated
+@ConfigurationProperties(prefix = "app")
+public class AppPropertiesBind {
+
+    @NotBlank
+    private String defaultCurrency;
+
+    private Map<String, Boolean> featureFlags;
+
+    // getters / setters
+}
+```
+
+Registration (in a config class or main app):
+
+```java
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+@EnableConfigurationProperties(AppPropertiesBind.class)
+public class AppConfig {
+}
+```
+
+Usage in services:
+
+```java
+@Service
+public class XService {
+
+    private final AppPropertiesBind appProperties;
+
+    public XService(AppPropertiesBind appProperties) {
+        this.appProperties = appProperties;
+    }
+
+    public void someMethod() {
+        String currency = appProperties.getDefaultCurrency();
+        Boolean publish = appProperties.getFeatureFlags()
+                .getOrDefault("publish-product-events", false);
+    }
+}
+```
+
+Rule of thumb:
+- Use one `@ConfigurationProperties` class per logical config group (e.g., `AppProperties`, `MessagingProperties`, `SecurityProperties`).
+- Use validation annotations (`@NotBlank`, `@Min`, etc.) to fail fast at startup if config is invalid.
+
+
+6. Feature Flags
+----------------
+Feature flags let you turn behavior on/off via config without code changes.
+
+Pattern in `application.yml`:
+
+```yaml
+app:
+  feature-flags:
+    publish-product-events: true
+    enable-new-checkout-flow: false
+```
+
+In a properties class:
+
+```java
+private Map<String, Boolean> featureFlags;
+```
+
+Usage in service:
+
+```java
+Boolean enabled = appProperties.getFeatureFlags()
+        .getOrDefault("enable-new-checkout-flow", false);
+
+if (Boolean.TRUE.equals(enabled)) {
+    // run new behavior
+} else {
+    // old behavior
+}
+```
+
+Rule of thumb:
+- Name flags clearly: `enable-*`, `use-*`, `feature-*`.
+- Use flags for **behavior**, not static configuration (like URLs).
+- For big features, consider tagging with rollout stages (e.g., `new-checkout-v2-beta`).
+
+
+7. Secrets Management (High-Level)
+----------------------------------
+Secrets include:
+- DB passwords
+- API keys
+- OAuth client secrets
+- JWT signing keys
+
+Best practices:
+- Do NOT hard-code secrets in code or commit them to Git.
+- Avoid putting raw secrets in `application.yml` committed to repo.
+- Use environment variables, secret managers, or encrypted config.
+
+Common approaches:
+
+1. Environment Variables
+   - `DB_PASSWORD`, `JWT_SECRET`, `OPENAI_API_KEY`, etc.
+   - Spring reads them via placeholders: `${DB_PASSWORD}`.
+
+2. Secret Stores (advanced)
+   - Spring Cloud Config + Vault, AWS Secrets Manager, Azure Key Vault, etc.
+   - Your app loads them at startup or on demand.
+
+Rule of thumb:
+- For learning: environment variables are okay.
+- For real services: integrate with an enterprise secret management solution.
+
+
+8. Spring Environment Object (Programmatic Access)
+--------------------------------------------------
+Sometimes you need to read config or know active profiles in code.
+
+```java
+import org.springframework.core.env.Environment;
+import org.springframework.stereotype.Component;
+
+@Component
+public class EnvInspector {
+
+    private final Environment env;
+
+    public EnvInspector(Environment env) {
+        this.env = env;
+    }
+
+    public void printInfo() {
+        String[] profiles = env.getActiveProfiles();
+        String dbUrl = env.getProperty("spring.datasource.url");
+        // ...
+    }
+}
+```
+
+Rule of thumb:
+- Prefer `@ConfigurationProperties` for structured config.
+- Use `Environment` only when you truly need dynamic/low-level access.
+
+
+9. Property Sources & Precedence (Mental Model)
+-----------------------------------------------
+In practice, remember this simplified precedence (highest wins):
+
+1. `--args` passed at runtime.
+2. Environment variables (`SPRING_*`, your own vars).
+3. `application-{profile}.yml` for active profile.
+4. `application.yml` base file.
+5. Defaults in code (`@ConfigurationProperties` default values).
+
+If you see a value not being picked up:
+- Check if a profile-specific file overrides it.
+- Check environment variables in your IDE/terminal.
+- Use `actuator/env` (if enabled) in real apps to introspect.
+
+
+10. Profiles + Beans (Profile-Specific Beans)
+---------------------------------------------
+Sometimes you want different beans per profile.
+
+```java
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
+
+@Configuration
+public class ProfileBasedConfig {
+
+    @Bean
+    @Profile("dev")
+    public XClient devClient() {
+        // dev stub client
+        return new DevXClient();
+    }
+
+    @Bean
+    @Profile("prod")
+    public XClient prodClient() {
+        // real prod client
+        return new ProdXClient();
+    }
+}
+```
+
+Rule of thumb:
+- Use profile-specific beans for dev stubs vs prod clients, or in-memory vs real implementations.
+- Avoid too many profile conditions inside single beans; keep config readable.
+
+
+11. Common Patterns for Microservices
+-------------------------------------
+
+1. **Per-service namespace**
+   - Use a top-level key for your app: `nyx.*` or `app.*`.
+
+2. **Per-feature namespace**
+   - `nyx.order.*`, `nyx.payment.*`, etc., or group by config type.
+
+3. **Cross-cutting config groups**
+   - `security.*`, `messaging.*`, `cache.*` → each with their own properties class.
+
+Example structure:
+
+```yaml
+nyx:
+  order:
+    default-currency: "USD"
+    max-items-per-order: 50
+
+  payment:
+    retry:
+      max-attempts: 3
+      backoff-seconds: 5
+
+messaging:
+  pulsar:
+    service-url: ${PULSAR_URL:pulsar://localhost:6650}
+    product-topic: ${PULSAR_PRODUCT_TOPIC:product-events}
+
+security:
+  jwt:
+    issuer: nyx-api
+    expiration-minutes: 60
+```
+
+
+12. Checklist for Spring Env in a New Service
+---------------------------------------------
+
+1. **Decide profile names.**
+   - `dev`, `test`, `stage`, `prod` (and maybe `local` if you want).
+
+2. **Create base `application.yml`.**
+   - Put shared config (app name, health endpoints, general defaults).
+
+3. **Create profile-specific files.**
+   - `application-dev.yml` for local dev settings (DB URL, debug options).
+   - `application-prod.yml` for hardened prod settings (no ddl-auto update, real URLs).
+
+4. **Use environment variable placeholders.**
+   - Especially for DB, external services, and secrets.
+
+5. **Define `@ConfigurationProperties` classes.**
+   - For each logical config group (e.g., `AppProperties`, `MessagingProperties`).
+
+6. **Wire config into services.**
+   - Inject property beans into services where needed.
+
+7. **Add feature flags where useful.**
+   - Use config-driven toggles for non-trivial behaviors.
+
+8. **Ensure secrets are externalized.**
+   - No hard-coded passwords or keys in Git.
+
+9. **Verify active profile in each environment.**
+   - Locally: set `spring.profiles.active=dev`.
+   - In prod: ensure deploy/runtime sets `spring.profiles.active=prod`.
+
+10. **Log key configuration on startup (without secrets).**
+    - Log active profiles and major flags (e.g., “publish-product-events = true”).
+
+
+13. Example: Putting It All Together for a Service "Nyx"
+--------------------------------------------------------
+
+Files:
+
+- `application.yml`  (base)
+- `application-dev.yml`
+- `application-prod.yml`
+
+**application.yml** (base)
+
+```yaml
+spring:
+  application:
+    name: nyx
+
+  jpa:
+    properties:
+      hibernate.format_sql: true
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+nyx:
+  default-currency: "USD"
+  feature-flags:
+    publish-product-events: true
+```
+
+**application-dev.yml**
+
+```yaml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: update
+
+  datasource:
+    url: jdbc:mysql://localhost:3306/nyx_products
+    username: root
+    password: password
+```
+
+**application-prod.yml**
+
+```yaml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+
+  datasource:
+    url: jdbc:mysql://${DB_HOST}:${DB_PORT:3306}/${DB_NAME}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+
+nyx:
+  feature-flags:
+    publish-product-events: true
+```
+
+**Properties class:**
+
+```java
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.util.Map;
+
+@Validated
+@ConfigurationProperties(prefix = "nyx")
+public class NyxProperties {
+
+    private String defaultCurrency;
+    private Map<String, Boolean> featureFlags;
+
+    // getters / setters
+}
+```
+
+**Usage in service:**
+
+```java
+@Service
+@Transactional
+public class XService {
+
+    private final NyxProperties nyxProperties;
+
+    public XService(NyxProperties nyxProperties) {
+        this.nyxProperties = nyxProperties;
+    }
+
+    public void someUseCase() {
+        String currency = nyxProperties.getDefaultCurrency();
+        Boolean publish = nyxProperties.getFeatureFlags()
+                .getOrDefault("publish-product-events", false);
+        // ...
+    }
+}
+```
+
+Final Thoughts
+--------------
+- Mastering Spring Env (profiles, config, flags, secrets) is what makes your
+  microservice **portable** and **production-ready**.
+- This is where “thinking like a senior architect” really shows: clean separation
+  of config per environment, good defaults, and no secrets in code.
+- Reuse this guide whenever you start a new microservice: design the **config model**
+  with as much care as you design entities, repositories, and services.

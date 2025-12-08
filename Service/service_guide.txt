@@ -1,0 +1,514 @@
+
+Service Design Guide for Spring Boot Microservices
+==================================================
+
+Goal
+----
+This file is your reusable template & checklist for designing **service layer**
+classes in Spring Boot microservices.
+
+A *Service* coordinates **use cases / business logic**, using:
+- Repositories (data access)
+- Config/properties (limits, defaults, feature flags)
+- External clients (messaging, HTTP, etc.)
+
+It does **not** deal directly with HTTP (that’s the controller)
+and does not know about JSON or request/response objects (except DTOs you design
+specifically for business logic).
+
+
+Big Picture: Layer Direction
+----------------------------
+
+Controller  →  Service  →  Repository  →  Entity  →  Database
+
+
+Golden Rules / Rules of Thumb
+-----------------------------
+1. Service = **business use cases**, not just a thin wrapper over repository.
+2. Keep controllers thin: push business decisions down into services.
+3. Use **constructor injection** for dependencies (no field injection).
+4. Define clear, intention-revealing methods: `createX`, `getX`, `updateX`, `deleteX`, etc.
+5. Put **transactional boundaries** on service methods, not repositories.
+6. Services can call multiple repositories and external systems in one use case.
+7. Services should be testable without HTTP or real DB (use mocks/stubs).
+
+
+Basic Service Template
+----------------------
+Package suggestion:
+- `com.<company>.<app>.<feature>.service`
+
+Generic example for feature X:
+
+```java
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+@Transactional
+public class XService {
+
+    private final XRepository xRepository;
+    private final SomeConfig config; // properties / config bean (optional)
+
+    public XService(XRepository xRepository, SomeConfig config) {
+        this.xRepository = xRepository;
+        this.config = config;
+    }
+
+    // Example use case methods will go here
+}
+```
+
+Key points:
+- `@Service` marks the class as a service bean.
+- `@Transactional` at class level → all public methods are transactional by default
+  (you can override with method-level annotations).
+- Dependencies are injected via constructor.
+
+
+How to Think Before Writing a Service
+-------------------------------------
+Before writing any code, answer these in plain language:
+
+1. What are the **use cases** for this feature?
+   - “Create a new X”
+   - “Get details of X by id”
+   - “Update attributes of X”
+   - “Delete X”
+   - “List X by status/date/user/etc.”
+   - “Perform action Y on X (e.g., cancel, approve, complete)”
+
+2. What **business rules** apply?
+   - Validation rules (e.g., cannot approve if status != PENDING)
+   - Default values (e.g., if no currency provided, use default from config)
+   - Limits (e.g., max items per order, rate limiting, etc.)
+
+3. Which **dependencies** are needed?
+   - One or more repositories?
+   - Configuration or feature flags?
+   - Message brokers (Kafka/Pulsar), external APIs, etc.
+
+
+Typical Service Responsibilities
+--------------------------------
+
+1. **Orchestrate persistence**
+   - Load entities using repositories
+   - Modify them according to rules
+   - Save them back
+
+2. **Apply business rules**
+   - Input validation (beyond simple field-level validation)
+   - State transitions (e.g., PENDING → APPROVED → COMPLETED)
+   - Conflict checks, uniqueness checks
+
+3. **Integrate with other subsystems**
+   - Emit events (e.g., to Kafka/Pulsar)
+   - Call other microservices (via REST clients)
+   - Compose data from multiple sources
+
+4. **Transactions & consistency**
+   - Mark methods with `@Transactional`
+   - Decide when to commit/rollback
+
+
+Typical CRUD Use Cases in Service
+---------------------------------
+
+### Create
+
+```java
+public XEntity createX(CreateXCommand command) {
+    // Perform validations
+    // Apply defaults from config
+    // Map command -> entity
+    XEntity entity = new XEntity(...);
+    return xRepository.save(entity);
+}
+```
+
+### Read
+
+```java
+@Transactional(readOnly = true)
+public XEntity getX(Long id) {
+    return xRepository.findById(id)
+            .orElseThrow(() -> new IllegalArgumentException("X not found: " + id));
+}
+```
+
+### Update
+
+```java
+public XEntity updateX(Long id, UpdateXCommand command) {
+    XEntity existing = getX(id);
+
+    // Update only fields allowed by business rules
+    if (command.getName() != null) {
+        existing.setName(command.getName());
+    }
+    // More fields...
+
+    return xRepository.save(existing);
+}
+```
+
+### Delete
+
+```java
+public void deleteX(Long id) {
+    if (!xRepository.existsById(id)) {
+        throw new IllegalArgumentException("X not found: " + id);
+    }
+    xRepository.deleteById(id);
+}
+```
+
+Note:
+- `CreateXCommand` / `UpdateXCommand` are optional DTOs you can define to avoid
+  exposing entities directly in the service API.
+
+
+Using Configuration / Properties in Service
+-------------------------------------------
+Services often use config values and feature flags.
+
+Example `application.yml` section:
+
+```yaml
+x:
+  default-limit: 100
+  feature-flags:
+    enable-special-behavior: true
+```
+
+Binding config:
+
+```java
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+import java.util.Map;
+
+@Validated
+@ConfigurationProperties(prefix = "x")
+public class XProperties {
+
+    private int defaultLimit;
+    private Map<String, Boolean> featureFlags;
+
+    // getters / setters
+}
+```
+
+Injecting into service:
+
+```java
+@Service
+@Transactional
+public class XService {
+
+    private final XRepository xRepository;
+    private final XProperties xProperties;
+
+    public XService(XRepository xRepository, XProperties xProperties) {
+        this.xRepository = xRepository;
+        this.xProperties = xProperties;
+    }
+
+    public XEntity createX(XEntity x) {
+        if (x.getLimit() == null) {
+            x.setLimit(xProperties.getDefaultLimit());
+        }
+
+        Boolean enabled = xProperties.getFeatureFlags()
+                .getOrDefault("enable-special-behavior", false);
+
+        if (Boolean.TRUE.equals(enabled)) {
+            // apply extra behavior
+        }
+
+        return xRepository.save(x);
+    }
+}
+```
+
+Rule of thumb:
+- Anything that might change per environment (limits, feature switches,
+  thresholds) should come from config, not be hard-coded.
+
+
+Transactions in Service Layer
+-----------------------------
+Service layer is the correct place to manage transactions.
+
+Common patterns:
+
+- Class-level `@Transactional`:
+  - All methods participate in a transaction.
+- Method-level `@Transactional(readOnly = true)` for read-only methods.
+
+Example:
+
+```java
+@Service
+@Transactional
+public class XService {
+
+    // write methods are transactional by default
+
+    @Transactional(readOnly = true)
+    public XEntity getX(Long id) {
+        return xRepository.findById(id)
+                .orElseThrow(...);
+    }
+}
+```
+
+Rules of thumb:
+- Do not put `@Transactional` on repository interfaces.
+- Mark read-only methods with `readOnly = true` for optimization and clarity.
+- For complex scenarios (nested calls), consider propagation rules, but that’s advanced.
+
+
+Error Handling & Exceptions
+---------------------------
+Service methods often throw exceptions when business rules are violated.
+
+Examples:
+- `IllegalArgumentException` for invalid arguments.
+- Custom exceptions: `XNotFoundException`, `InvalidXStateException`, etc.
+
+Example custom exception:
+
+```java
+public class XNotFoundException extends RuntimeException {
+    public XNotFoundException(Long id) {
+        super("X not found: " + id);
+    }
+}
+```
+
+Usage in service:
+
+```java
+public XEntity getX(Long id) {
+    return xRepository.findById(id)
+            .orElseThrow(() -> new XNotFoundException(id));
+}
+```
+
+Rule of thumb:
+- Use meaningful exception types to let controllers map them to proper HTTP responses.
+- Don’t catch exceptions in service just to log and rethrow the same thing.
+
+
+Integration with Messaging / Events
+-----------------------------------
+Services are the right place to emit domain events after important state changes.
+
+Pseudo-pattern:
+
+```java
+public XEntity createX(XEntity x) {
+    XEntity saved = xRepository.save(x);
+
+    // publish event (Kafka, Pulsar, etc.)
+    XCreatedEvent event = new XCreatedEvent(saved.getId(), saved.getName());
+    eventPublisher.publish(event);
+
+    return saved;
+}
+```
+
+Rules of thumb:
+- Persist first, then publish event (or use outbox pattern for reliability).
+- Use feature flags if needed to enable/disable event publishing.
+
+
+Special Cases & Patterns
+------------------------
+
+1. Idempotent Operations
+------------------------
+Some operations should be safe to call multiple times with the same effect.
+
+Example:
+- Marking X as "completed" when it’s already completed should not fail hard.
+
+Pattern:
+- Check current state before applying transition.
+- Only update when state really changes.
+
+2. State Machines
+-----------------
+When entities have well-defined state transitions:
+
+- Define allowed transitions in service layer.
+- Enforce them before calling `save()`.
+
+Example:
+
+```java
+public XEntity approveX(Long id) {
+    XEntity x = getX(id);
+
+    if (!x.getStatus().equals(Status.PENDING)) {
+        throw new InvalidXStateException("Can only approve from PENDING");
+    }
+
+    x.setStatus(Status.APPROVED);
+    return xRepository.save(x);
+}
+```
+
+3. Multiple Repositories
+------------------------
+A service can coordinate multiple entities.
+
+Example:
+- Creating an Order may require:
+  - Validating Customer
+  - Checking Inventory
+  - Reserving Stock
+  - Saving Order
+
+Pattern:
+- One service method orchestrates all steps, in one transaction if appropriate.
+
+4. Mapping between Entities and DTOs
+------------------------------------
+Sometimes service methods work with DTOs instead of entities.
+
+Example:
+
+```java
+public XDto getXDetails(Long id) {
+    XEntity x = getX(id);
+    return mapToDto(x);
+}
+```
+
+Rules of thumb:
+- Mapping can live in service or a dedicated mapper class.
+- Keep mapping logic simple and predictable.
+
+
+Step-by-Step Checklist When Creating a Service
+----------------------------------------------
+When you create a new service for feature X, follow this list:
+
+1. **List use cases in plain language.**
+   - Create X, Get X, Update X, Delete X, plus any custom actions.
+
+2. **Define method signatures for each use case.**
+   - Inputs: ids, commands/DTOs, filters.
+   - Outputs: entities or DTOs.
+
+3. **Identify dependencies.**
+   - Which repositories? Which config beans? Any external clients?
+
+4. **Create constructor with required dependencies.**
+   - Use final fields + constructor injection.
+
+5. **Implement business logic per method.**
+   - Load entities.
+   - Validate inputs and states.
+   - Apply rules & defaults.
+   - Save changes.
+
+6. **Add transaction boundaries.**
+   - `@Transactional` at class level.
+   - `@Transactional(readOnly = true)` on query methods.
+
+7. **Decide on exceptions.**
+   - Use meaningful exceptions for not-found and invalid states.
+
+8. **Add logging where it adds value.**
+   - Log important events (created/updated/canceled) at INFO level.
+
+9. **(Optional) Integrate messaging.**
+   - After persisting, emit domain events if needed.
+
+10. **Review with golden rules.**
+    - No HTTP-specific logic here.
+    - No direct DB calls, only repositories.
+    - Config and feature flags are used instead of hard-coded magic numbers.
+
+
+Example: Generic Service Skeleton for Any X
+-------------------------------------------
+
+```java
+package com.company.app.x.service;
+
+import com.company.app.x.entity.XEntity;
+import com.company.app.x.repository.XRepository;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+
+@Slf4j
+@Service
+@Transactional
+public class XService {
+
+    private final XRepository xRepository;
+    private final XProperties xProperties; // optional
+
+    public XService(XRepository xRepository,
+                    XProperties xProperties) {
+        this.xRepository = xRepository;
+        this.xProperties = xProperties;
+    }
+
+    // CREATE
+    public XEntity createX(XEntity x) {
+        // apply defaults using xProperties if needed
+        XEntity saved = xRepository.save(x);
+        log.info("Created X with id={}", saved.getId());
+        return saved;
+    }
+
+    // READ all
+    @Transactional(readOnly = true)
+    public List<XEntity> getAllX() {
+        return xRepository.findAll();
+    }
+
+    // READ one
+    @Transactional(readOnly = true)
+    public XEntity getX(Long id) {
+        return xRepository.findById(id)
+                .orElseThrow(() -> new XNotFoundException(id));
+    }
+
+    // UPDATE
+    public XEntity updateX(Long id, XEntity incoming) {
+        XEntity existing = getX(id);
+        // apply updates with rules
+        return xRepository.save(existing);
+    }
+
+    // DELETE
+    public void deleteX(Long id) {
+        if (!xRepository.existsById(id)) {
+            throw new XNotFoundException(id);
+        }
+        xRepository.deleteById(id);
+        log.info("Deleted X with id={}", id);
+    }
+}
+```
+
+Final Thoughts
+--------------
+- The service layer is where your microservice gets its **brain**.
+- If your service methods read like clear English descriptions of use cases,
+  you’re doing it right.
+- Reuse this file whenever you design a new service: think in terms of
+  **use cases**, **dependencies**, **transactions**, and **rules**, not just CRUD.

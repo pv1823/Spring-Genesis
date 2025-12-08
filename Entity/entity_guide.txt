@@ -1,0 +1,332 @@
+
+Entity Design Guide for Spring Boot Microservices
+=================================================
+
+Goal
+----
+This file is your mental and practical template for designing JPA entities
+in Spring Boot microservices. Treat it as a checklist you can reuse for ANY
+domain: Product, Order, Payment, User, etc.
+
+High-Level Idea
+---------------
+An *Entity* represents **one row** in a database table.
+
+Golden Rules / Rules of Thumb
+-----------------------------
+1. An entity models persistent state, NOT business workflows.
+2. Keep entities "dumb" data holders with minimal behavior
+   (lifecycle callbacks, simple invariants only).
+3. Do NOT inject services, repositories, or HTTP things into entities.
+4. One entity ≈ one table. Relationships are explicit (`@ManyToOne`, etc.).
+5. If something is environment-specific (limits, flags, defaults),
+   keep it in config / service, not in the entity.
+6. Prefer explicit field names/types over “clever” tricks.
+7. Always think about how this entity will evolve over time
+   (backward compatible schema changes).
+
+Basic Entity Template
+---------------------
+Package suggestion:
+- `com.<company>.<app>.entity` or `com.<company>.<app>.domain`
+
+Minimal template (without Lombok):
+
+```java
+import jakarta.persistence.*;
+import java.time.Instant;
+
+@Entity
+@Table(name = "x") // table name in DB
+public class XEntity {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private String name;
+
+    private String description;
+
+    @Column(nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @Column(nullable = false)
+    private Instant updatedAt;
+
+    protected XEntity() {
+        // JPA requires a no-arg constructor (at least protected)
+    }
+
+    public XEntity(String name, String description) {
+        this.name = name;
+        this.description = description;
+    }
+
+    @PrePersist
+    void onCreate() {
+        this.createdAt = Instant.now();
+        this.updatedAt = this.createdAt;
+    }
+
+    @PreUpdate
+    void onUpdate() {
+        this.updatedAt = Instant.now();
+    }
+
+    // getters / setters
+}
+```
+
+How to Think Before Writing an Entity
+-------------------------------------
+Ask yourself these questions and answer them in plain words *before* coding:
+
+1. WHAT is this entity?
+   - Example: "A Payment represents a single payment attempt by a customer."
+
+2. WHAT fields does ONE instance need to store long-term?
+   - IDs, business keys, amounts, statuses, timestamps, references to others.
+
+3. WHAT is required vs optional?
+   - Required → `nullable = false` in `@Column` if possible.
+   - Optional → allow null or provide defaults at service level.
+
+4. WHAT should never change after creation?
+   - Example: `createdAt`, immutable business keys.
+
+5. ANY relationships with other entities?
+   - Many-to-one, one-to-many, etc.
+
+6. ANY constraints?
+   - uniqueness, max length, numeric range (some can be validated at DB level).
+
+Cheat Sheet: Common Annotations
+-------------------------------
+- `@Entity` – marks the class as a JPA entity.
+- `@Table(name = "table_name")` – controls the DB table name.
+- `@Id` – primary key field.
+- `@GeneratedValue(strategy = GenerationType.IDENTITY)` – DB-generated PK.
+- `@Column(nullable = false, unique = true, length = 100)` – field constraints.
+- `@Enumerated(EnumType.STRING)` – store enum as string.
+- `@PrePersist` – callback before insert.
+- `@PreUpdate` – callback before update.
+- Relationships:
+  - `@ManyToOne`
+  - `@OneToMany(mappedBy = "...")`
+  - `@OneToOne`
+  - `@ManyToMany`
+
+Lombok Version of the Template
+------------------------------
+If you use Lombok, you can cut a lot of boilerplate.
+
+```java
+import jakarta.persistence.*;
+import java.time.Instant;
+import lombok.*;
+
+@Entity
+@Table(name = "x")
+@Getter
+@Setter
+@NoArgsConstructor(access = AccessLevel.PROTECTED) // JPA requirement
+@AllArgsConstructor
+@Builder
+public class XEntity {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private String name;
+
+    private String description;
+
+    @Column(nullable = false, updatable = false)
+    private Instant createdAt;
+
+    @Column(nullable = false)
+    private Instant updatedAt;
+
+    @PrePersist
+    void onCreate() {
+        this.createdAt = Instant.now();
+        this.updatedAt = this.createdAt;
+    }
+
+    @PreUpdate
+    void onUpdate() {
+        this.updatedAt = Instant.now();
+    }
+}
+```
+
+Special Cases & Patterns
+------------------------
+
+1. Enums
+--------
+Use enums for controlled sets of values (status, type, etc.).
+
+```java
+public enum PaymentStatus {
+    PENDING, SUCCESS, FAILED
+}
+
+@Entity
+public class PaymentEntity {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private PaymentStatus status;
+}
+```
+
+Rule of thumb:
+- Always use `EnumType.STRING`, not `ORDINAL`, to avoid breakages when
+  you reorder enum values.
+
+2. Money / Amounts
+------------------
+Never use `double`/`float` for money. Use `BigDecimal`.
+
+```java
+@Column(nullable = false, precision = 15, scale = 2)
+private BigDecimal amount;
+```
+
+Rule of thumb:
+- Always specify `precision` and `scale` for monetary fields.
+
+3. Timestamps
+-------------
+Prefer `Instant` / `OffsetDateTime` over `java.util.Date`.
+
+- Creation time: `createdAt`
+- Last update: `updatedAt`
+
+Set via `@PrePersist` / `@PreUpdate` or via database triggers.
+
+4. Soft Delete vs Hard Delete
+-----------------------------
+If you need soft delete:
+
+```java
+@Column(nullable = false)
+private boolean deleted = false;
+```
+
+Then filter in repository/service. Don’t implement soft delete unless you
+really need it – it complicates everything.
+
+5. Relationships (Simple Mental Model)
+--------------------------------------
+Many-to-one:
+- Many Orders belong to one Customer.
+
+```java
+@ManyToOne(optional = false, fetch = FetchType.LAZY)
+@JoinColumn(name = "customer_id")
+private CustomerEntity customer;
+```
+
+Rule of thumb:
+- Default to `LAZY` loading for associations except when absolutely necessary.
+
+One-to-many:
+- Usually mapped from the “one” side:
+
+```java
+@OneToMany(mappedBy = "customer", cascade = CascadeType.ALL)
+private List<OrderEntity> orders = new ArrayList<>();
+```
+
+Rule of thumb:
+- Be careful with large collections and `@OneToMany` eager loading.
+- For microservices, often keep relationships simple or represent them
+  just by IDs, not full entity graphs.
+
+6. Immutable / Read-Only Fields
+-------------------------------
+Fields that should never change after creation:
+
+```java
+@Column(nullable = false, updatable = false)
+private String businessKey;
+```
+
+Rule of thumb:
+- Mark truly immutable columns with `updatable = false` for safety.
+
+7. Validation vs Persistence
+----------------------------
+- Beans validation (`@NotNull`, `@Size`, etc.) can be added on fields.
+- Heavy business rules go to the service layer.
+
+Example:
+
+```java
+@NotBlank
+@Size(max = 100)
+@Column(nullable = false, length = 100)
+private String name;
+```
+
+Rule of thumb:
+- Basic shape/format validation on entity is OK.
+- Complex rules involving other entities/services → service layer.
+
+Step-by-Step Checklist When Creating an Entity
+----------------------------------------------
+When you create a new entity X, walk through this list:
+
+1. **Name the entity**
+   - Class: `XEntity`
+   - Table: `"x"` or `"xs"` (consistent naming per project).
+
+2. **Define primary key**
+   - Usually `Long id` with `@GeneratedValue`.
+
+3. **List all persistent fields**
+   - Decide types.
+   - Decide which are required (`nullable = false`).
+
+4. **Add audit fields (optional but recommended)**
+   - `createdAt`, `updatedAt` with `Instant`.
+
+5. **Add relationships, if any**
+   - `@ManyToOne`, `@OneToMany`, etc. Use `LAZY` by default.
+
+6. **Add constructor(s)**
+   - No-args constructor (protected for JPA).
+   - Business constructor for required fields OR use Lombok `@Builder`.
+
+7. **Add lifecycle callbacks**
+   - `@PrePersist` and `@PreUpdate` for time fields, defaults, etc.
+
+8. **Add validation annotations (optional)**
+   - `@NotNull`, `@NotBlank`, `@Size`, etc.
+
+9. **Review with rules of thumb**
+   - No service/repository in entity.
+   - No HTTP concepts here.
+   - No environment-specific constants.
+   - Money uses `BigDecimal`.
+   - Enums use `EnumType.STRING`.
+   - Relationships are not over-complicated.
+
+Final Thoughts
+--------------
+- Entities should feel "boring" and predictable.
+- The real intelligence lives in the service layer and configuration.
+- If an entity starts to look too smart or too heavy, push logic upwards
+  to the service.
+
+Reuse this file as a reference every time you create a new entity.
