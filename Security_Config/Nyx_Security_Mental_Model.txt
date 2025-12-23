@@ -1,0 +1,105 @@
+﻿Nyx Security Configuration Mental Model & Authorization Matrix
+Spring Boot 3.x • Spring Security 6 • REST-only microservice
+
+
+Purpose: Provide a reusable, production-style template for designing and implementing security (RBAC) in Nyx and other Spring microservices.
+Assumptions: Java 17, Spring Boot 3.5.x line, Spring Security 6 (SecurityFilterChain, no WebSecurityConfigurerAdapter), JSON APIs, MySQL, Actuator health/info exposed.
+
+
+1. Core Mental Model
+When you write security for a REST microservice, think in three layers—in this exact order:
+1. Transport posture — stateless vs stateful, CSRF, sessions
+2. Authentication — who is calling? (Basic now, JWT/OAuth2 later)
+3. Authorization (RBAC) — what can they do? (roles/authorities)
+
+
+Practical analogy: the SecurityFilterChain is the club’s bouncer plus the rulebook. Posture sets the venue rules, authentication checks identity, and authorization decides entry per route.
+2. REST Transport Posture (Nyx Defaults)
+* CSRF disabled — appropriate for stateless APIs (CSRF is mainly a browser cookie/session issue).
+* STATELESS sessions — every request carries credentials; the server does not create or rely on HTTP sessions.
+Rule of thumb: If you are not using browser sessions, default to stateless + no CSRF.
+3. Authentication vs Authorization (Keep Them Separate)
+Authentication answers “who are you?” and produces a Principal plus Authorities. Authorization answers “what can you do?” by comparing request patterns and authorities.
+* Start simple: HTTP Basic — fastest way to validate rules locally.
+* Upgrade later: JWT/OAuth2/Okta — swap the authentication mechanism without rewriting your RBAC matrix.
+Gotcha: In Spring,
+* hasRole("ADMIN") checks for authority ROLE_ADMIN. Keep role naming consistent (prefer ADMIN/USER uppercase).
+4. Request Matching is a Routing Table
+Inside authorizeHttpRequests, rules are evaluated top-to-bottom. The first match wins, so order is part of security.
+* Specific before general — lock down /admin/** and write methods before broad /api/** rules.
+* Fallback last — always end with anyRequest().authenticated() (or denyAll() for stricter posture).
+5. Authorization Matrix (Policy First, Code Second)
+As services grow, a long list of requestMatchers becomes hard to reason about. An authorization matrix makes the policy explicit, reviewable, and consistent across microservices.
+Nyx baseline matrix (generic template):
+Area
+	Endpoint pattern
+	GET (Read)
+	POST (Create)
+	PUT/PATCH (Update)
+	DELETE (Remove)
+	Ops
+	/actuator/health, /actuator/info
+	Public
+	N/A
+	N/A
+	N/A
+	Public
+	/public/**
+	Public
+	Public (if needed)
+	Public (if needed)
+	Public (if needed)
+	Business API
+	/api/**
+	Mode-dependent
+	ADMIN
+	ADMIN
+	ADMIN
+	Admin
+	/admin/**
+	ADMIN
+	ADMIN
+	ADMIN
+	ADMIN
+	
+
+Two common modes for the Business API (/api/**):
+* Mode A — Open Read: GET is public; writes require ADMIN.
+* Mode B — Authenticated Read (recommended): GET requires authentication; writes require ADMIN. Use /public/** for truly public endpoints.
+6. Implementation Blueprint (SecurityFilterChain Shape)
+A clean SecurityFilterChain for Nyx follows this shape:
+4. Posture: csrf + sessionManagement
+5. Authorization rules: requestMatchers implementing the matrix
+6. Authentication mechanism: httpBasic now; oauth2ResourceServer(jwt) later
+7. build()
+Minimal matrix-to-code skeleton (generic):
+@Bean
+SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+ return http
+   .csrf(csrf -> csrf.disable())
+   .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+   .authorizeHttpRequests(auth -> auth
+     .requestMatchers("/actuator/health", "/actuator/info").permitAll()
+     .requestMatchers("/public/**").permitAll()
+     // Choose one:
+     // .requestMatchers(HttpMethod.GET, "/api/**").permitAll()
+     .requestMatchers(HttpMethod.GET, "/api/**").authenticated()
+     .requestMatchers(HttpMethod.POST, "/api/**").hasRole("ADMIN")
+     .requestMatchers(HttpMethod.PUT, "/api/**").hasRole("ADMIN")
+     .requestMatchers(HttpMethod.PATCH, "/api/**").hasRole("ADMIN")
+     .requestMatchers(HttpMethod.DELETE, "/api/**").hasRole("ADMIN")
+     .requestMatchers("/admin/**").hasRole("ADMIN")
+     .anyRequest().authenticated()
+   )
+   .httpBasic(Customizer.withDefaults())
+   .build();
+}
+
+	7. Common Gotchas (Quick Checks)
+* Ordering bug: a broad permitAll early can accidentally override stricter rules below it.
+* Role mismatch: hasRole("ADMIN") requires ROLE_ADMIN; keep naming consistent.
+* Actuator exposure: endpoint must be exposed in management.endpoints.web.exposure.include and permitted in security rules.
+* Stateless expectation: if you rely on sessions, your API will behave differently across instances—avoid for microservices.
+
+
+Nyx mantra: Make the API stateless, expose only essential public endpoints, be intentional about read access, restrict writes to ADMIN, and keep matcher order tight.
